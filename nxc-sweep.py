@@ -55,7 +55,6 @@ def debug_print(*args, **kwargs):
     """
     global DEBUG_MODE
     if DEBUG_MODE:
-        # Add grey color to the message if not already colored
         colored_args = []
         for arg in args:
             if isinstance(arg, str) and not arg.startswith('\033'):
@@ -91,7 +90,7 @@ def find_nxc() -> Optional[str]:
     return nxc_path
 
 
-def parse_nxc_output(output: str, protocol: str, username: str, password: str) -> Tuple[bool, str]:
+def parse_nxc_output(output: str, protocol: str, username: str, password: str) -> Tuple[bool, str, Optional[str]]:
     """
     Parse nxc output to determine if credentials were valid.
     
@@ -99,83 +98,80 @@ def parse_nxc_output(output: str, protocol: str, username: str, password: str) -
     Valid: [+] domain\\username:password
     Invalid: [-] domain\\username:password STATUS_ERROR
     Invalid: [-] domain\\username:password 
+    
+    Returns:
+        Tuple[bool, str, Optional[str]]: (is_valid, status_message, successful_host)
     """
-    # Clean the output for parsing
     output_lines = output.strip().split('\n')
     
-    # Pattern to extract username:password combination from nxc output
     domain_user_pass_pattern = r'\[([+-])\]\s+([^\\]+)\\([^:]+):([^\s]*)(?:\s+(.+))?'
+    host_pattern = r'([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)'  # IP pattern
     
-    # Track if we found a match for our specific credentials
     found_our_creds = False
     is_valid = False
     status_message = ""
+    successful_host = None
     
     debug_print(f"[*] Parsing nxc output for {protocol} ({len(output_lines)} lines)")
     
     for line in output_lines:
+        # Extract host/IP if present
+        host_match = re.search(host_pattern, line)
+        current_host = host_match.group(1) if host_match else None
+        
         match = re.search(domain_user_pass_pattern, line)
         if match:
-            sign = match.group(1)  # + or -
-            domain = match.group(2)  # domain or hostname
-            found_username = match.group(3)  # username
-            # found_password = match.group(4)  # password (could be empty)
-            status = match.group(5) if match.group(5) else ""  # status message
+            sign = match.group(1)
+            domain = match.group(2)
+            found_username = match.group(3)
+            status = match.group(5) if match.group(5) else ""
             
             debug_print(f"[*] Found pattern: [{sign}] {domain}\\{found_username}")
             
-            # Check if this line matches our credentials
             username_matches = (found_username.lower() == username.lower())
             
             if username_matches:
                 found_our_creds = True
                 
-                # Check if credentials are valid based on sign
                 if sign == "+":
                     is_valid = True
                     status_message = "Authentication successful"
-                    debug_print(f"[*] Found [+] pattern for {protocol}: {domain}\\{found_username}")
-                    break  # Stop at first successful match
-                else:  # sign == "-"
+                    successful_host = current_host
+                    debug_print(f"[*] Found [+] pattern for {protocol}: {domain}\\{found_username} on {successful_host}")
+                    break
+                else:
                     is_valid = False
-                    # Use the status from the output if available
                     status_message = status if status else "Authentication failed"
                     debug_print(f"[*] Found [-] pattern for {protocol}: {domain}\\{found_username} - {status_message}")
-                    # Don't break, continue looking for a [+] match
     
-    # If we found a [-] match but no [+] match, return the status
     if found_our_creds and not is_valid:
-        return False, status_message
+        return False, status_message, None
        
-    # If we found a [+] match 
     if found_our_creds and is_valid:
-        return True, "Authentication successful"
+        return True, "Authentication successful", successful_host
     
-    # If we didn't find our specific credentials in the output,
-    # look for any [+] or [-] pattern with any username
     if not found_our_creds:
         debug_print(f"[*] No specific credential match found for {username}, checking for any [+] patterns")
         
-        # Look for ANY [+] pattern (successful auth with any user)
         any_success_pattern = r'\[\+\]\s+[^\\]+\\[^:]+:[^\s]*'
         any_failure_pattern = r'\[\-\]\s+[^\\]+\\[^:]+:[^\s]*(?:\s+(.+))?'
         
-        # First check for any success
         success_match = re.search(any_success_pattern, output, re.IGNORECASE)
         if success_match:
+            # Try to extract host from the success line
+            host_match = re.search(host_pattern, success_match.group(0))
+            successful_host = host_match.group(1) if host_match else None
             debug_print(f"[*] Found generic [+] pattern for {protocol}: {success_match.group(0)}")
-            return True, "Authentication successful"
+            return True, "Authentication successful", successful_host
         
-        # Then check for any failure with status
         failure_match = re.search(any_failure_pattern, output, re.IGNORECASE)
         if failure_match:
             status_from_match = failure_match.group(1) if failure_match.group(1) else "Authentication failed"
             debug_print(f"[*] Found generic [-] pattern for {protocol} with status: {status_from_match}")
-            return False, status_from_match
+            return False, status_from_match, None
     
-    # If no patterns found at all, assume invalid
     debug_print(f"[*] No [+] or [-] patterns found for {protocol}, assuming invalid")
-    return False, "No authentication response detected"
+    return False, "No authentication response detected", None
 
 
 def check_xargs_available():
@@ -223,67 +219,56 @@ def get_protocol_specific_auth_flags(proto):
     These flags optimize the authentication check.
     """
     auth_flags = {
-        'ldap': ['--simple'],      # Use simple bind for LDAP
-        'ssh': ['-k'],             # Accept any SSH key
+        'ldap': ['--simple'],
+        'ssh': ['-k'],
     }
     result = auth_flags.get(proto, [])
     debug_print(f"[*] Auth flags for {proto}: {result}")
     return result
 
 
-def build_safe_flags(proto, use_local_auth, use_continue, auth_only=False):
+def build_safe_flags(proto, use_local_auth, auth_only=False):
     """Build safe flags list for a protocol."""
     safe_flags = []
     
     debug_print(f"[*] Building flags for {proto} (auth_only={auth_only}, local_auth={use_local_auth})")
     
     if auth_only:
-        # Authentication-only mode flags
-        safe_flags.extend(['--no-bruteforce', '--continue-on-success'])
-        # Add protocol-specific auth flags
+        safe_flags.extend(['--no-bruteforce'])
         safe_flags.extend(get_protocol_specific_auth_flags(proto))
     else:
-        # Normal mode - add protocol defaults
         safe_flags.extend(apply_protocol_defaults(proto))
     
-    # --local-auth only applies to certain protocols (Windows-based auth)
     local_auth_protos = ['smb', 'winrm', 'rdp', 'mssql', 'wmi']
     if use_local_auth and proto in local_auth_protos:
         safe_flags.append('--local-auth')
         debug_print(f"{BLUE}[!] Applying '--local-auth' for {proto}{NC}")
-    
-    if use_continue:
-        safe_flags.append('--continue-on-success')
-    
+        
     debug_print(f"[*] Final flags for {proto}: {safe_flags}")
     return safe_flags
 
 
 def execute_nxc_auth_check(nxc_path: str, protocol: str, hosts: List[str], 
                           username: str, password: str, use_local_auth: bool = False,
-                          timeout: int = 20) -> Tuple[bool, str, str]:
+                          timeout: int = 20) -> Tuple[bool, str, str, Optional[str]]:
     """
     Execute nxc command for authentication check only.
-    Returns (is_valid, output, status_message).
+    Returns (is_valid, output, status_message, successful_host).
     """
     try:
-        # Build authentication-only command
         command = [
             nxc_path,
             protocol
         ] + hosts + [
             '-u', username,
             '-p', password,
-            '--no-bruteforce',
-            '--continue-on-success'
+            '--no-bruteforce'
         ]
         
-        # Add protocol-specific authentication flags
         auth_flags = get_protocol_specific_auth_flags(protocol)
         if auth_flags:
             command.extend(auth_flags)
         
-        # Add local-auth if applicable
         if use_local_auth and protocol in ['smb', 'winrm', 'rdp', 'mssql', 'wmi']:
             command.append('--local-auth')
         
@@ -292,7 +277,6 @@ def execute_nxc_auth_check(nxc_path: str, protocol: str, hosts: List[str],
             debug_print(f"[*] Using --local-auth")
         debug_print(f"[*] Command: {' '.join(command)}")
         
-        # Execute with timeout for auth check
         result = subprocess.run(
             command,
             capture_output=True,
@@ -304,57 +288,55 @@ def execute_nxc_auth_check(nxc_path: str, protocol: str, hosts: List[str],
         output = result.stdout + result.stderr
         debug_print(f"[*] Raw output for {protocol}:\n{output[:500]}")
         
-        # Parse output to check if authentication was successful
-        is_valid, status_message = parse_nxc_output(output, protocol, username, password)
+        is_valid, status_message, successful_host = parse_nxc_output(output, protocol, username, password)
         
-        return is_valid, output, status_message
+        return is_valid, output, status_message, successful_host
         
     except subprocess.TimeoutExpired:
         debug_print(f"[*] Timeout checking {protocol} authentication")
-        return False, f"Timeout checking {protocol}", "Timeout"
+        return False, f"Timeout checking {protocol}", "Timeout", None
     except Exception as e:
         debug_print(f"[*] Error checking {protocol}: {e}")
-        return False, str(e), f"Error: {e}"
+        return False, str(e), f"Error: {e}", None
 
 
 def test_protocol_with_local_auth(nxc_path: str, protocol: str, hosts: List[str], 
-                                  username: str, password: str, timeout: int = 20) -> Tuple[bool, str]:
+                                  username: str, password: str, timeout: int = 20) -> Tuple[bool, str, Optional[str]]:
     """
     Test SMB or WMI protocol both with and without --local-auth flag.
     """
     debug_print(f"[*] Starting dual authentication test for {protocol}")
     
-    # Track status messages from both attempts
     status_messages = []
+    successful_host = None
     
     # Test 1: Without --local-auth (default)
-    is_valid_default, output_default, status_default = execute_nxc_auth_check(
+    is_valid_default, output_default, status_default, host_default = execute_nxc_auth_check(
         nxc_path, protocol, hosts, username, password, use_local_auth=False, timeout=timeout
     )
     
     if is_valid_default:
         debug_print(f"[*] {protocol} authentication successful without --local-auth")
-        return True, status_default
+        return True, status_default, host_default
     
     status_messages.append(f"Without --local-auth: {status_default}")
     debug_print(f"[*] {protocol} default auth failed: {status_default}")
     
     # Test 2: With --local-auth
-    is_valid_local, output_local, status_local = execute_nxc_auth_check(
+    is_valid_local, output_local, status_local, host_local = execute_nxc_auth_check(
         nxc_path, protocol, hosts, username, password, use_local_auth=True, timeout=timeout
     )
     
     if is_valid_local:
         debug_print(f"[*] {protocol} authentication successful with --local-auth")
-        return True, status_local
+        return True, status_local, host_local
     
     status_messages.append(f"With --local-auth: {status_local}")
     debug_print(f"[*] {protocol} local auth failed: {status_local}")
     
-    # Return combined status
     combined_status = "; ".join(status_messages)
     debug_print(f"[*] {protocol} authentication failed both with and without --local-auth")
-    return False, combined_status
+    return False, combined_status, None
 
 
 def find_live_hosts(port, hosts, xargs_available, max_jobs, timeout=1):
@@ -367,7 +349,6 @@ def find_live_hosts(port, hosts, xargs_available, max_jobs, timeout=1):
     debug_print(f"[*] Scanning port {port} for {len(hosts)} host(s)")
     
     if xargs_available and len(hosts) > 1:
-        # Use xargs with parallel execution
         debug_print(f"[*] Using xargs with {max_jobs} parallel jobs")
         hosts_str = '\n'.join(hosts)
         try:
@@ -391,7 +372,6 @@ def find_live_hosts(port, hosts, xargs_available, max_jobs, timeout=1):
             safe_print(f"{YELLOW}[!] Error scanning hosts: {e}{NC}")
             return []
     else:
-        # Sequential execution
         debug_print(f"[*] Using sequential host scanning")
         for host in hosts:
             try:
@@ -435,7 +415,7 @@ def process_single_protocol(proto_data):
         proto_data: Tuple containing (proto, host_list, args, nxc_path, xargs_available, max_jobs)
     
     Returns:
-        Tuple of (proto, is_valid, status_message, live_count, total_count)
+        Tuple of (proto, is_valid, status_message, live_count, total_count, successful_host)
     """
     proto, host_list, args, nxc_path, xargs_available, max_jobs = proto_data
     port = PROTO_PORTS.get(proto)
@@ -455,22 +435,24 @@ def process_single_protocol(proto_data):
     if not live_hosts:
         debug_print(f"[*] No live hosts for {proto}")
         debug_print(f"{GREY}○ {proto.upper():6s} | 0/{len(host_list):<3d} hosts | port {port} - No live hosts{NC}")
-        return (proto, False, "No live hosts", 0, len(host_list))
+        return (proto, False, "No live hosts", 0, len(host_list), None)
     
     # Authentication testing phase
     debug_print(f"[*] Starting auth test for {proto} on {len(live_hosts)} host(s)")
     safe_print(f"{GREEN}[+] [{proto.upper()}] Testing {len(live_hosts)} host(s)...{NC}")
     
+    successful_host = None
+    
     # For SMB and WMI, test both with and without --local-auth
     if proto in ["smb", "wmi"]:
         debug_print(f"[*] Using dual auth test for {proto}")
-        is_valid, status_message = test_protocol_with_local_auth(
+        is_valid, status_message, successful_host = test_protocol_with_local_auth(
             nxc_path, proto, live_hosts, args.username, args.password, args.timeout
         )
     else:
         # For other protocols, use normal authentication check
         debug_print(f"[*] Using single auth test for {proto}")
-        is_valid, output, status_message = execute_nxc_auth_check(
+        is_valid, output, status_message, successful_host = execute_nxc_auth_check(
             nxc_path, proto, live_hosts, args.username, args.password, 
             use_local_auth=args.local_auth, timeout=args.timeout
         )
@@ -478,18 +460,20 @@ def process_single_protocol(proto_data):
     # Display result
     if is_valid:
         debug_print(f"[*] {proto} authentication SUCCESS: {status_message}")
-        safe_print(f"{GREEN}✓ {proto.upper():6s} | {len(live_hosts):3d}/{len(host_list):<3d} hosts | port {port} - {status_message}{NC}")
+        if successful_host:
+            safe_print(f"{GREEN}✓ {proto.upper():6s} | {len(live_hosts):3d}/{len(host_list):<3d} hosts | port {port} - {status_message} on {successful_host}{NC}")
+        else:
+            safe_print(f"{GREEN}✓ {proto.upper():6s} | {len(live_hosts):3d}/{len(host_list):<3d} hosts | port {port} - {status_message}{NC}")
     else:
         debug_print(f"[*] {proto} authentication FAILED: {status_message}")
         safe_print(f"{RED}✗ {proto.upper():6s} | {len(live_hosts):3d}/{len(host_list):<3d} hosts | port {port} - {status_message}{NC}")
     
-    return (proto, is_valid, status_message, len(live_hosts), len(host_list))
+    return (proto, is_valid, status_message, len(live_hosts), len(host_list), successful_host)
 
 
 def main():
     global DEBUG_MODE
     
-    # Custom help formatter to show protocols
     class CustomFormatter(argparse.RawDescriptionHelpFormatter):
         pass
     
@@ -540,8 +524,6 @@ Use -d/--debug for verbose debug output.{NC}
                        help='Enable debug output (verbose grey text messages)')
     parser.add_argument('--local-auth', action='store_true',
                        help='Authenticate against local accounts (smb, winrm, rdp, mssql, wmi)')
-    parser.add_argument('--continue-on-success', action='store_true',
-                       help='Keep testing remaining credentials/hosts after success')
     parser.add_argument('--no-port-check', action='store_true',
                        help='Skip port checking and spray all targets')
     parser.add_argument('--timeout', type=int, default=20,
@@ -549,30 +531,24 @@ Use -d/--debug for verbose debug output.{NC}
     parser.add_argument('--port-timeout', type=int, default=1,
                        help='Timeout for port checking in seconds (default: 1)')
     
-    # Parse arguments
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
     
     args = parser.parse_args()
     
-    # Set global debug mode
     DEBUG_MODE = args.debug
     
     if DEBUG_MODE:
         safe_print(f"{GREY}[*] Debug mode enabled{NC}")
     
-    # Check for nxc executable early
     nxc_path = find_nxc()
-    
-    # Check for xargs availability early
     xargs_available, max_jobs = check_xargs_available()
     
     debug_print(f"[*] NXC Path: {nxc_path}")
     debug_print(f"[*] Xargs available: {xargs_available}")
     debug_print(f"[*] Max jobs: {max_jobs}")
     
-    # Parse protocols
     if args.protocols.lower() == 'all':
         proto_array = ALL_PROTOS
     else:
@@ -580,7 +556,6 @@ Use -d/--debug for verbose debug output.{NC}
     
     debug_print(f"[*] Requested protocols: {proto_array}")
     
-    # Validate protocols
     valid_protos = []
     invalid_protos = []
     for proto in proto_array:
@@ -600,7 +575,6 @@ Use -d/--debug for verbose debug output.{NC}
     
     debug_print(f"[*] Valid protocols to test: {valid_protos}")
     
-    # Parse targets
     host_list = parse_targets(args.targets)
     
     if not host_list:
@@ -621,19 +595,17 @@ Use -d/--debug for verbose debug output.{NC}
     safe_print(f"    Debug Mode:  {'ON' if DEBUG_MODE else 'OFF'}")
     safe_print()
     
-    # Create temp directory for target file
     tmp_dir = tempfile.mkdtemp()
     target_file = os.path.join(tmp_dir, 'targets.txt')
     
     debug_print(f"[*] Temp directory: {tmp_dir}")
     
-    # Results tracking
     results = {}
     success_count = 0
     failed_count = 0
+    success_details = []  # Store successful protocol details
     
     try:
-        # Prepare data for parallel execution
         protocol_tasks = [
             (proto, host_list, args, nxc_path, xargs_available, max_jobs)
             for proto in valid_protos
@@ -642,12 +614,10 @@ Use -d/--debug for verbose debug output.{NC}
         debug_print(f"[*] Created {len(protocol_tasks)} protocol tasks")
         debug_print(f"[*] Starting ThreadPoolExecutor with {args.workers} workers")
         
-        # Use ThreadPoolExecutor for parallel protocol testing
         safe_print(f"{GREEN}[+] Starting parallel scan with {args.workers} workers...{NC}")
         safe_print(f"{'='*60}")
         
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            # Submit all tasks
             future_to_proto = {
                 executor.submit(process_single_protocol, task): task[0]
                 for task in protocol_tasks
@@ -655,25 +625,28 @@ Use -d/--debug for verbose debug output.{NC}
             
             debug_print(f"[*] Submitted {len(future_to_proto)} tasks to executor")
             
-            # Process completed tasks as they finish
             for future in as_completed(future_to_proto):
                 proto = future_to_proto[future]
                 try:
                     proto_result = future.result()
-                    proto_name, is_valid, status_message, live_count, total_count = proto_result
-                    results[proto_name] = (is_valid, status_message)
+                    proto_name, is_valid, status_message, live_count, total_count, successful_host = proto_result
+                    results[proto_name] = (is_valid, status_message, successful_host)
                     
-                    debug_print(f"[*] Task completed for {proto_name}: valid={is_valid}")
+                    debug_print(f"[*] Task completed for {proto_name}: valid={is_valid}, host={successful_host}")
                     
                     if is_valid:
                         success_count += 1
+                        if successful_host:
+                            success_details.append(f"{proto_name.upper()} on {successful_host}")
+                        else:
+                            success_details.append(f"{proto_name.upper()}")
                     else:
                         failed_count += 1
                         
                 except Exception as e:
                     debug_print(f"[*] Error processing {proto}: {e}")
                     safe_print(f"{RED}[!] Error processing {proto}: {e}{NC}")
-                    results[proto] = (False, f"Error: {e}")
+                    results[proto] = (False, f"Error: {e}", None)
                     failed_count += 1
         
         debug_print(f"[*] All tasks completed")
@@ -682,7 +655,6 @@ Use -d/--debug for verbose debug output.{NC}
     except KeyboardInterrupt:
         safe_print(f"\n{YELLOW}[!] Scan interrupted by user.{NC}")
     finally:
-        # Cleanup temp directory
         debug_print(f"[*] Cleaning up temp directory: {tmp_dir}")
         shutil.rmtree(tmp_dir, ignore_errors=True)
     
@@ -694,14 +666,21 @@ Use -d/--debug for verbose debug output.{NC}
     safe_print(f"Protocols tested: {total}")
     safe_print(f"{GREEN}Valid credentials: {success_count}{NC}")
     safe_print(f"{RED}Invalid credentials: {failed_count}{NC}")
+    
+    if success_details:
+        safe_print(f"\n{GREEN}Successful protocols with hosts:{NC}")
+        for detail in success_details:
+            safe_print(f"  {GREEN}✓ {detail}{NC}")
+    
     safe_print(f"\nDetailed Results:")
     safe_print(f"{'-'*60}")
     
     for proto in valid_protos:
         if proto in results:
-            is_valid, status = results[proto]
+            is_valid, status, successful_host = results[proto]
             if is_valid:
-                safe_print(f"  {GREEN}✓ {proto.upper():6s} - {status}{NC}")
+                host_info = f" on {successful_host}" if successful_host else ""
+                safe_print(f"  {GREEN}✓ {proto.upper():6s} - {status}{host_info}{NC}")
             else:
                 safe_print(f"  {RED}✗ {proto.upper():6s} - {status}{NC}")
         else:
@@ -711,7 +690,6 @@ Use -d/--debug for verbose debug output.{NC}
     
     debug_print(f"[*] Exiting with code {'0' if success_count > 0 else '1'}")
     
-    # Exit with appropriate code
     sys.exit(0 if success_count > 0 else 1)
 
 
