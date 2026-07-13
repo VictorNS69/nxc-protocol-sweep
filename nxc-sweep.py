@@ -6,12 +6,15 @@ import sys
 import tempfile
 import os
 import shutil
+import re
 from pathlib import Path
+from typing import List, Optional, Dict, Any, Tuple
 
 # --- Colors ---
 BLUE = '\033[38;5;117m'
 YELLOW = '\033[38;5;226m'
 GREEN = '\033[0;32m'
+RED = '\033[0;31m'
 GREY = '\033[38;5;244m'
 NC = '\033[0m'
 
@@ -32,6 +35,101 @@ PROTO_PORTS = {
 ALL_PROTOS = ['nfs', 'ftp', 'smb', 'vnc', 'winrm', 'ssh', 'rdp', 'wmi', 'ldap', 'mssql']
 
 
+def find_nxc() -> Optional[str]:
+    """
+    Find nxc (NetExec) executable in the system PATH.
+    Checks for both 'nxc' and 'netexec' commands.
+    """
+    nxc_path = shutil.which("nxc") or shutil.which("netexec")
+    
+    if not nxc_path:
+        print(f"{RED}[!] ERROR: nxc (netexec) not found in system{NC}")
+        print(f"{RED}[!] Make sure it's installed and in your PATH{NC}")
+        print(f"{RED}[!] Installation: pip install netexec{NC}")
+        sys.exit(1)
+    
+    return nxc_path
+
+
+def parse_nxc_output(output: str, protocol: str, username: str, password: str) -> Tuple[bool, str]:
+    """
+    Parse nxc output to determine if credentials were valid.
+    
+    Looks for the following patterns:
+    Valid: [+] domain\\username:password
+    Invalid: [-] domain\\username:password STATUS_ERROR
+    Invalid: [-] domain\\username:password 
+    """
+    # Clean the output for parsing
+    output_lines = output.strip().split('\n')
+    
+    # Pattern to extract username:password combination from nxc output
+    # Matches patterns like:
+    # [+] domain\username:password
+    # [-] domain\username:password STATUS_REASON
+    domain_user_pass_pattern = r'\[([+-])\]\s+([^\\]+)\\([^:]+):([^\s]*)(?:\s+(.+))?'
+    
+    # Track if we found a match for our specific credentials
+    found_our_creds = False
+    is_valid = False
+    status_message = ""
+    
+    for line in output_lines:
+        match = re.search(domain_user_pass_pattern, line)
+        if match:
+            sign = match.group(1)  # + or -
+            domain = match.group(2)  # domain or hostname
+            found_username = match.group(3)  # username
+            found_password = match.group(4)  # password (could be empty)
+            status = match.group(5) if match.group(5) else ""  # status message
+            
+            # Check if this line matches our credentials
+            username_matches = (found_username.lower() == username.lower())
+            
+            if username_matches:
+                found_our_creds = True
+                
+                # Check if credentials are valid based on sign
+                if sign == "+":
+                    is_valid = True
+                    status_message = "Authentication successful"
+                    break  # Stop at first successful match
+                else:  # sign == "-"
+                    is_valid = False
+                    # Use the status from the output if available
+                    status_message = status if status else "Authentication failed"
+                    # Don't break, continue looking for a [+] match
+    
+    # If we found a [-] match but no [+] match, return the status
+    if found_our_creds and not is_valid:
+        return False, status_message
+       
+    # If we found a [+] match 
+    if found_our_creds and is_valid:
+        return True, "Authentication successful"
+    
+    # If we didn't find our specific credentials in the output,
+    # look for any [+] or [-] pattern with any username
+    if not found_our_creds:
+        # Look for ANY [+] pattern (successful auth with any user)
+        any_success_pattern = r'\[\+\]\s+[^\\]+\\[^:]+:[^\s]*'
+        any_failure_pattern = r'\[\-\]\s+[^\\]+\\[^:]+:[^\s]*(?:\s+(.+))?'
+        
+        # First check for any success
+        success_match = re.search(any_success_pattern, output, re.IGNORECASE)
+        if success_match:
+            return True, "Authentication successful"
+        
+        # Then check for any failure with status
+        failure_match = re.search(any_failure_pattern, output, re.IGNORECASE)
+        if failure_match:
+            status_from_match = failure_match.group(1) if failure_match.group(1) else "Authentication failed"
+            return False, status_from_match
+    
+    # If no patterns found at all, assume invalid
+    return False, "No authentication response detected"
+
+
 def check_xargs_available():
     """Check if xargs is available and return max jobs."""
     xargs_available = shutil.which('xargs') is not None
@@ -50,20 +148,41 @@ def apply_protocol_defaults(proto):
         'smb': ['--shares'],
         'ftp': ['--ls'],
         'mssql': ['-q', 'SELECT name FROM master.sys.databases;'],
-        'nfs': ['--shares'],  # List NFS shares by default
-        'vnc': ['--check'],   # Basic VNC connectivity check
-        'wmi': ['--wmi'],     # WMI query
-        'ldap': ['--users'],  # Enumerate users by default
-        'ssh': ['--sudo-check'],  # Check sudo access
-        'winrm': ['--exec-method', 'smbexec'],  # Default execution method
-        'rdp': ['--screenshot']  # Take screenshot on successful login
+        'nfs': ['--shares'],
+        'vnc': ['--check'],
+        'wmi': ['--wmi'],
+        'ldap': ['--users'],
+        'ssh': ['--sudo-check'],
+        'winrm': ['--exec-method', 'smbexec'],
+        'rdp': ['--screenshot']
     }
     return defaults.get(proto, [])
 
 
-def build_safe_flags(proto, use_local_auth, use_continue):
+def get_protocol_specific_auth_flags(proto):
+    """
+    Get protocol-specific authentication flags for auth-only testing.
+    These flags optimize the authentication check.
+    """
+    auth_flags = {
+        'ldap': ['--simple'],      # Use simple bind for LDAP
+        'ssh': ['-k'],             # Accept any SSH key
+    }
+    return auth_flags.get(proto, [])
+
+
+def build_safe_flags(proto, use_local_auth, use_continue, auth_only=False):
     """Build safe flags list for a protocol."""
-    safe_flags = apply_protocol_defaults(proto)
+    safe_flags = []
+    
+    if auth_only:
+        # Authentication-only mode flags
+        safe_flags.extend(['--no-bruteforce', '--continue-on-success'])
+        # Add protocol-specific auth flags
+        safe_flags.extend(get_protocol_specific_auth_flags(proto))
+    else:
+        # Normal mode - add protocol defaults
+        safe_flags.extend(apply_protocol_defaults(proto))
     
     # --local-auth only applies to certain protocols (Windows-based auth)
     local_auth_protos = ['smb', 'winrm', 'rdp', 'mssql', 'wmi']
@@ -77,7 +196,90 @@ def build_safe_flags(proto, use_local_auth, use_continue):
     return safe_flags
 
 
-def find_live_hosts(port, hosts, xargs_available, max_jobs):
+def execute_nxc_auth_check(nxc_path: str, protocol: str, hosts: List[str], 
+                          username: str, password: str, use_local_auth: bool = False,
+                          timeout: int = 20) -> Tuple[bool, str, str]:
+    """
+    Execute nxc command for authentication check only.
+    Returns (is_valid, output, status_message).
+    """
+    try:
+        # Build authentication-only command
+        command = [
+            nxc_path,
+            protocol
+        ] + hosts + [
+            '-u', username,
+            '-p', password,
+            '--no-bruteforce',
+            '--continue-on-success'
+        ]
+        
+        # Add protocol-specific authentication flags
+        auth_flags = get_protocol_specific_auth_flags(protocol)
+        if auth_flags:
+            command.extend(auth_flags)
+        
+        # Add local-auth if applicable
+        if use_local_auth and protocol in ['smb', 'winrm', 'rdp', 'mssql', 'wmi']:
+            command.append('--local-auth')
+        
+        # Execute with timeout for auth check
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False
+        )
+        
+        output = result.stdout + result.stderr
+        
+        # Parse output to check if authentication was successful
+        is_valid, status_message = parse_nxc_output(output, protocol, username, password)
+        
+        return is_valid, output, status_message
+        
+    except subprocess.TimeoutExpired:
+        return False, f"Timeout checking {protocol}", "Timeout"
+    except Exception as e:
+        return False, str(e), f"Error: {e}"
+
+
+def test_protocol_with_local_auth(nxc_path: str, protocol: str, hosts: List[str], 
+                                  username: str, password: str, timeout: int = 20) -> Tuple[bool, str]:
+    """
+    Test SMB or WMI protocol both with and without --local-auth flag.
+    """
+    # Track status messages from both attempts
+    status_messages = []
+    
+    # Test 1: Without --local-auth (default)
+    is_valid_default, output_default, status_default = execute_nxc_auth_check(
+        nxc_path, protocol, hosts, username, password, use_local_auth=False, timeout=timeout
+    )
+    
+    if is_valid_default:
+        return True, status_default
+    
+    status_messages.append(f"Without --local-auth: {status_default}")
+    
+    # Test 2: With --local-auth
+    is_valid_local, output_local, status_local = execute_nxc_auth_check(
+        nxc_path, protocol, hosts, username, password, use_local_auth=True, timeout=timeout
+    )
+    
+    if is_valid_local:
+        return True, status_local
+    
+    status_messages.append(f"With --local-auth: {status_local}")
+    
+    # Return combined status
+    combined_status = "; ".join(status_messages)
+    return False, combined_status
+
+
+def find_live_hosts(port, hosts, xargs_available, max_jobs, timeout=1):
     """Find live hosts by checking if port is open."""
     live_hosts = []
     
@@ -90,7 +292,7 @@ def find_live_hosts(port, hosts, xargs_available, max_jobs):
         try:
             result = subprocess.run(
                 ['xargs', '-P', str(max_jobs), '-I{}', 'bash', '-c',
-                 'nc -z -w 1 "$1" "$2" 2>/dev/null && printf "%s\n" "$1"',
+                 f'nc -z -w {timeout} "$1" "$2" 2>/dev/null && printf "%s\\n" "$1"',
                  '_', '{}', str(port)],
                 input=hosts_str,
                 text=True,
@@ -109,7 +311,7 @@ def find_live_hosts(port, hosts, xargs_available, max_jobs):
         for host in hosts:
             try:
                 subprocess.run(
-                    ['nc', '-z', '-w', '1', host, str(port)],
+                    ['nc', '-z', '-w', str(timeout), host, str(port)],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=2
@@ -154,6 +356,9 @@ def print_summary(protocol, live_count, total_count, success=False):
 
 
 def main():
+    # Check for nxc executable early
+    nxc_path = find_nxc()
+    
     # Check for xargs availability early
     xargs_available, max_jobs = check_xargs_available()
     
@@ -181,7 +386,7 @@ def main():
   mssql (1433)       - Microsoft SQL Server
 
 {GREY}Note: Each protocol sprays with sensible built-in defaults automatically.
-Example: nxc-protocol-sweep smb,rdp,ssh targets.txt -u admin -p Pass123 --local-auth{NC}
+For SMB and WMI, both local and domain auth are tested automatically.{NC}
         ''',
         formatter_class=CustomFormatter,
         add_help=True
@@ -206,7 +411,9 @@ Example: nxc-protocol-sweep smb,rdp,ssh targets.txt -u admin -p Pass123 --local-
                        help='Keep testing remaining credentials/hosts after success')
     parser.add_argument('--no-port-check', action='store_true',
                        help='Skip port checking and spray all targets')
-    parser.add_argument('--timeout', type=int, default=1,
+    parser.add_argument('--timeout', type=int, default=20,
+                       help='Timeout for authentication checks in seconds (default: 20)')
+    parser.add_argument('--port-timeout', type=int, default=1,
                        help='Timeout for port checking in seconds (default: 1)')
     
     # Parse arguments
@@ -247,10 +454,12 @@ Example: nxc-protocol-sweep smb,rdp,ssh targets.txt -u admin -p Pass123 --local-
         sys.exit(1)
     
     print(f"\n{GREEN}[+] Starting NXCStorm{NC}")
+    print(f"    NXC Path:  {nxc_path}")
     print(f"    Protocols: {', '.join(valid_protos).upper()}")
     print(f"    Targets:   {len(host_list)} host(s)")
     print(f"    Username:  {args.username}")
     print(f"    Password:  {'*' * len(args.password)}")
+    print(f"    Timeout:   {args.timeout}s")
     print()
     
     # Create temp directory for target file
@@ -270,7 +479,7 @@ Example: nxc-protocol-sweep smb,rdp,ssh targets.txt -u admin -p Pass123 --local-
                 print(f"{BLUE}[*] Skipping port check for {proto}{NC}")
             else:
                 print(f"{GREY}[*] Checking port {port} for {proto}...{NC}", end=' ', flush=True)
-                live_hosts = find_live_hosts(port, host_list, xargs_available, max_jobs)
+                live_hosts = find_live_hosts(port, host_list, xargs_available, max_jobs, args.port_timeout)
                 print(f"Found {len(live_hosts)} live host(s)")
             
             if not live_hosts:
@@ -279,28 +488,32 @@ Example: nxc-protocol-sweep smb,rdp,ssh targets.txt -u admin -p Pass123 --local-
                 failed_count += 1
                 continue
             
-            # Build per-protocol flag list
-            safe_flags = build_safe_flags(proto, args.local_auth, args.continue_on_success)
+            print(f"\n{GREEN}[+] Testing {proto.upper()} ({len(live_hosts)} host(s)){NC}")
             
-            print(f"\n{GREEN}[+] Spraying {proto.upper()} ({len(live_hosts)} host(s)){NC}")
-            
-            # Prepare targets for nxc
-            if len(live_hosts) == 1:
-                targets_for_nxc = [live_hosts[0]]
+            # For SMB and WMI, test both with and without --local-auth
+            if proto in ["smb", "wmi"]:
+                is_valid, status_message = test_protocol_with_local_auth(
+                    nxc_path, proto, live_hosts, args.username, args.password, args.timeout
+                )
             else:
-                # Write targets to temp file for nxc
-                with open(target_file, 'w') as f:
-                    f.write('\n'.join(live_hosts))
-                targets_for_nxc = [target_file]
+                # For other protocols, use normal authentication check
+                is_valid, output, status_message = execute_nxc_auth_check(
+                    nxc_path, proto, live_hosts, args.username, args.password, 
+                    use_local_auth=args.local_auth, timeout=args.timeout
+                )
             
-            returncode = spray_protocol(proto, targets_for_nxc, args.username, args.password, safe_flags)
-            
-            if returncode == 0:
+            # Display result
+            if is_valid:
+                print(f"  {GREEN}✓ VALID - {status_message}{NC}")
                 success_count += 1
-                print_summary(proto, len(live_hosts), len(host_list), success=True)
             else:
+                print(f"  {RED}✗ INVALID - {status_message}{NC}")
                 failed_count += 1
-                print_summary(proto, len(live_hosts), len(host_list))
+            
+            # If valid and not continuing, stop
+            if is_valid and not args.continue_on_success:
+                print(f"{GREEN}[!] Valid credentials found. Stopping.{NC}")
+                break
             
             print()
     
@@ -311,10 +524,27 @@ Example: nxc-protocol-sweep smb,rdp,ssh targets.txt -u admin -p Pass123 --local-
         shutil.rmtree(tmp_dir, ignore_errors=True)
     
     # Final summary
-    print(f"\n{GREEN}╔══════════════════════════════════════════════════════════════╗")
-    print(f"║  Spray Complete!                                             ║")
-    print(f"║  Successful: {success_count:<2} | Failed: {failed_count:<2} | Total: {success_count + failed_count:<2}                                    ║")
-    print(f"╚══════════════════════════════════════════════════════════════╝{NC}\n")
+    total = success_count + failed_count
+    print(f"\n{'='*60}")
+    print("NXCSTORM SCAN SUMMARY")
+    print(f"{'='*60}")
+    print(f"Protocols tested: {total}")
+    print(f"{GREEN}Valid credentials: {success_count}{NC}")
+    print(f"{RED}Invalid credentials: {failed_count}{NC}")
+    print(f"\nValid access for:")
+    
+    if success_count > 0:
+        for proto in valid_protos:
+            # We'd need to track this per protocol, but for simplicity just show count
+            pass
+        print(f"  {GREEN}Credentials valid on {success_count} protocol(s){NC}")
+    else:
+        print(f"  {RED}None{NC}")
+    
+    print(f"{'='*60}\n")
+    
+    # Exit with appropriate code
+    sys.exit(0 if success_count > 0 else 1)
 
 
 if __name__ == '__main__':
