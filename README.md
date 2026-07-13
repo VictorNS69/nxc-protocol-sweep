@@ -1,4 +1,4 @@
-# nxc-protocol-sweep
+# nxc-protocol-sweep v1.0-test
 Multi-protocol scanner using nxc (NetExec)
 
 ## Requirements
