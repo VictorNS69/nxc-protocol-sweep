@@ -137,7 +137,7 @@ def parse_nxc_output(output: str, protocol: str, username: str, password: str) -
                     is_valid = True
                     status_message = "Authentication successful"
                     successful_host = current_host
-                    debug_print(f"[*] Found [+] pattern for {protocol}: {domain}\\{found_username} on {successful_host}")
+                    debug_print(f"[*] Found [+] pattern for {protocol}: {domain}\\{found_username}")
                     break
                 else:
                     is_valid = False
@@ -248,7 +248,7 @@ def build_safe_flags(proto, use_local_auth, auth_only=False):
     return safe_flags
 
 
-def execute_nxc_auth_check(nxc_path: str, protocol: str, hosts: List[str], 
+def execute_nxc_auth_check(nxc_path: str, protocol: str, host: str, 
                           username: str, password: str, use_local_auth: bool = False,
                           timeout: int = 20) -> Tuple[bool, str, str, Optional[str]]:
     """
@@ -258,8 +258,8 @@ def execute_nxc_auth_check(nxc_path: str, protocol: str, hosts: List[str],
     try:
         command = [
             nxc_path,
-            protocol
-        ] + hosts + [
+            protocol,
+            host,  # Single host only
             '-u', username,
             '-p', password,
             '--no-bruteforce'
@@ -272,7 +272,7 @@ def execute_nxc_auth_check(nxc_path: str, protocol: str, hosts: List[str],
         if use_local_auth and protocol in ['smb', 'winrm', 'rdp', 'mssql', 'wmi']:
             command.append('--local-auth')
         
-        debug_print(f"[*] Testing {protocol} authentication on {hosts}")
+        debug_print(f"[*] Testing {protocol} authentication")
         if use_local_auth:
             debug_print(f"[*] Using --local-auth")
         debug_print(f"[*] Command: {' '.join(command)}")
@@ -300,7 +300,7 @@ def execute_nxc_auth_check(nxc_path: str, protocol: str, hosts: List[str],
         return False, str(e), f"Error: {e}", None
 
 
-def test_protocol_with_local_auth(nxc_path: str, protocol: str, hosts: List[str], 
+def test_protocol_with_local_auth(nxc_path: str, protocol: str, host: str, 
                                   username: str, password: str, timeout: int = 20) -> Tuple[bool, str, Optional[str]]:
     """
     Test SMB or WMI protocol both with and without --local-auth flag.
@@ -312,7 +312,7 @@ def test_protocol_with_local_auth(nxc_path: str, protocol: str, hosts: List[str]
     
     # Test 1: Without --local-auth (default)
     is_valid_default, output_default, status_default, host_default = execute_nxc_auth_check(
-        nxc_path, protocol, hosts, username, password, use_local_auth=False, timeout=timeout
+        nxc_path, protocol, host, username, password, use_local_auth=False, timeout=timeout
     )
     
     if is_valid_default:
@@ -324,7 +324,7 @@ def test_protocol_with_local_auth(nxc_path: str, protocol: str, hosts: List[str]
     
     # Test 2: With --local-auth
     is_valid_local, output_local, status_local, host_local = execute_nxc_auth_check(
-        nxc_path, protocol, hosts, username, password, use_local_auth=True, timeout=timeout
+        nxc_path, protocol, host, username, password, use_local_auth=True, timeout=timeout
     )
     
     if is_valid_local:
@@ -339,71 +339,22 @@ def test_protocol_with_local_auth(nxc_path: str, protocol: str, hosts: List[str]
     return False, combined_status, None
 
 
-def find_live_hosts(port, hosts, xargs_available, max_jobs, timeout=1):
-    """Find live hosts by checking if port is open."""
-    live_hosts = []
+def find_live_host(port, host, timeout=1):
+    """Check if a single host has the port open."""
+    debug_print(f"[*] Checking if port {port} is open")
     
-    if not hosts:
-        return live_hosts
-    
-    debug_print(f"[*] Scanning port {port} for {len(hosts)} host(s)")
-    
-    if xargs_available and len(hosts) > 1:
-        debug_print(f"[*] Using xargs with {max_jobs} parallel jobs")
-        hosts_str = '\n'.join(hosts)
-        try:
-            result = subprocess.run(
-                ['xargs', '-P', str(max_jobs), '-I{}', 'bash', '-c',
-                 f'nc -z -w {timeout} "$1" "$2" 2>/dev/null && printf "%s\\n" "$1"',
-                 '_', '{}', str(port)],
-                input=hosts_str,
-                text=True,
-                capture_output=True,
-                timeout=60
-            )
-            live_hosts = [h for h in result.stdout.strip().split('\n') if h]
-            debug_print(f"[*] xargs found {len(live_hosts)} live host(s) on port {port}")
-        except subprocess.TimeoutExpired:
-            debug_print(f"[*] Timeout while scanning hosts for port {port}")
-            safe_print(f"{YELLOW}[!] Timeout while scanning hosts for port {port}{NC}")
-            return []
-        except Exception as e:
-            debug_print(f"[*] Error scanning hosts: {e}")
-            safe_print(f"{YELLOW}[!] Error scanning hosts: {e}{NC}")
-            return []
-    else:
-        debug_print(f"[*] Using sequential host scanning")
-        for host in hosts:
-            try:
-                subprocess.run(
-                    ['nc', '-z', '-w', str(timeout), host, str(port)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2
-                )
-                live_hosts.append(host)
-                debug_print(f"[*] Host {host} is alive on port {port}")
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                debug_print(f"[*] Host {host} is not responding on port {port}")
-    
-    return live_hosts
-
-
-def parse_targets(targets_raw):
-    """Parse targets from file or string."""
-    targets_path = Path(targets_raw)
-    debug_print(f"[*] Parsing targets: {targets_raw}")
-    
-    if targets_path.is_file():
-        debug_print(f"[*] Reading targets from file: {targets_path}")
-        with open(targets_path, 'r') as f:
-            hosts = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
-        debug_print(f"[*] Loaded {len(hosts)} host(s) from file")
-    else:
-        hosts = [targets_raw]
-        debug_print(f"[*] Using single target: {targets_raw}")
-    
-    return hosts
+    try:
+        subprocess.run(
+            ['nc', '-z', '-w', str(timeout), host, str(port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        )
+        debug_print(f"[*] Host {host} is alive on port {port}")
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        debug_print(f"[*] Host {host} is not responding on port {port}")
+        return False
 
 
 def process_single_protocol(proto_data):
@@ -412,34 +363,34 @@ def process_single_protocol(proto_data):
     This function is designed to be called in parallel.
     
     Args:
-        proto_data: Tuple containing (proto, host_list, args, nxc_path, xargs_available, max_jobs)
+        proto_data: Tuple containing (proto, host, args, nxc_path, xargs_available, max_jobs)
     
     Returns:
         Tuple of (proto, is_valid, status_message, live_count, total_count, successful_host)
     """
-    proto, host_list, args, nxc_path, xargs_available, max_jobs = proto_data
+    proto, host, args, nxc_path, xargs_available, max_jobs = proto_data
     port = PROTO_PORTS.get(proto)
     
-    debug_print(f"[*] Processing protocol: {proto} (port {port})")
+    debug_print(f"[*] Processing protocol: {proto} (port {port}) on host: {host}")
     
     # Port checking phase
     if args.no_port_check or port is None:
-        live_hosts = host_list.copy()
+        is_live = True
         debug_print(f"[*] Skipping port check for {proto}")
         debug_print(f"{BLUE}[*] [{proto.upper()}] Skipping port check{NC}")
     else:
         debug_print(f"{GREY}[*] [{proto.upper()}] Checking port {port}...{NC}")
-        live_hosts = find_live_hosts(port, host_list, xargs_available, max_jobs, args.port_timeout)
-        debug_print(f"{GREY}[*] [{proto.upper()}] Found {len(live_hosts)} live host(s){NC}")
+        is_live = find_live_host(port, host, args.port_timeout)
+        debug_print(f"{GREY}[*] [{proto.upper()}] Host {'is' if is_live else 'is not'} live on port {port}{NC}")
     
-    if not live_hosts:
-        debug_print(f"[*] No live hosts for {proto}")
-        debug_print(f"{GREY}○ {proto.upper():6s} | 0/{len(host_list):<3d} hosts | port {port} - No live hosts{NC}")
-        return (proto, False, "No live hosts", 0, len(host_list), None)
+    if not is_live:
+        debug_print(f"[*] Host not alive for {proto}")
+        debug_print(f"{GREY}○ {proto.upper():6s} | port {port} - Host not alive{NC}")
+        return (proto, False, "Host not alive", 0, 1, None)
     
     # Authentication testing phase
-    debug_print(f"[*] Starting auth test for {proto} on {len(live_hosts)} host(s)")
-    safe_print(f"{GREEN}[+] [{proto.upper()}] Testing {len(live_hosts)} host(s)...{NC}")
+    debug_print(f"[*] Starting auth test for {proto} on {host}")
+    safe_print(f"{GREEN}[+] [{proto.upper()}] Testing ...{NC}")
     
     successful_host = None
     
@@ -447,13 +398,13 @@ def process_single_protocol(proto_data):
     if proto in ["smb", "wmi"]:
         debug_print(f"[*] Using dual auth test for {proto}")
         is_valid, status_message, successful_host = test_protocol_with_local_auth(
-            nxc_path, proto, live_hosts, args.username, args.password, args.timeout
+            nxc_path, proto, host, args.username, args.password, args.timeout
         )
     else:
         # For other protocols, use normal authentication check
         debug_print(f"[*] Using single auth test for {proto}")
         is_valid, output, status_message, successful_host = execute_nxc_auth_check(
-            nxc_path, proto, live_hosts, args.username, args.password, 
+            nxc_path, proto, host, args.username, args.password, 
             use_local_auth=args.local_auth, timeout=args.timeout
         )
     
@@ -461,14 +412,14 @@ def process_single_protocol(proto_data):
     if is_valid:
         debug_print(f"[*] {proto} authentication SUCCESS: {status_message}")
         if successful_host:
-            safe_print(f"{GREEN}✓ {proto.upper():6s} | {len(live_hosts):3d}/{len(host_list):<3d} hosts | port {port} - {status_message} on {successful_host}{NC}")
+            safe_print(f"{GREEN}✓ {proto.upper():6s} | port {port} - {status_message} {NC}")
         else:
-            safe_print(f"{GREEN}✓ {proto.upper():6s} | {len(live_hosts):3d}/{len(host_list):<3d} hosts | port {port} - {status_message}{NC}")
+            safe_print(f"{GREEN}✓ {proto.upper():6s} | port {port} - {status_message}{NC}")
     else:
         debug_print(f"[*] {proto} authentication FAILED: {status_message}")
-        safe_print(f"{RED}✗ {proto.upper():6s} | {len(live_hosts):3d}/{len(host_list):<3d} hosts | port {port} - {status_message}{NC}")
+        safe_print(f"{RED}✗ {proto.upper():6s} | port {port} - {status_message}{NC}")
     
-    return (proto, is_valid, status_message, len(live_hosts), len(host_list), successful_host)
+    return (proto, is_valid, status_message, 1 if is_live else 0, 1, successful_host)
 
 
 def main():
@@ -508,8 +459,8 @@ Use -d/--debug for verbose debug output.{NC}
     # Positional arguments
     parser.add_argument('protocols', 
                        help='Protocol(s) to use (comma-separated or "all")')
-    parser.add_argument('targets', 
-                       help='Target IP(s), CIDR range, or file containing targets')
+    parser.add_argument('target', 
+                       help='Single target IP address or domain name (NOT a file)')
     
     # Required arguments
     parser.add_argument('-u', '--username', required=True, 
@@ -575,18 +526,33 @@ Use -d/--debug for verbose debug output.{NC}
     
     debug_print(f"[*] Valid protocols to test: {valid_protos}")
     
-    host_list = parse_targets(args.targets)
-    
-    if not host_list:
-        safe_print(f"{YELLOW}[-] No valid targets found.{NC}")
+    # Single target only - no file processing
+    target = args.target.strip()
+    if not target:
+        safe_print(f"{YELLOW}[-] No target specified.{NC}")
         sys.exit(1)
     
-    debug_print(f"[*] Total targets: {len(host_list)}")
+    # Basic validation - ensure it's not a file path
+    if os.path.exists(target):
+        safe_print(f"{RED}[!] ERROR: Target must be a single IP or domain, not a file path.{NC}")
+        safe_print(f"{RED}[!] Found existing file: {target}{NC}")
+        sys.exit(1)
+    
+    # Check if it looks like an IP or domain (simple validation)
+    ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+    domain_pattern = r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$'
+    
+    if not (re.match(ip_pattern, target) or re.match(domain_pattern, target)):
+        safe_print(f"{YELLOW}[!] Warning: '{target}' doesn't look like a valid IP or domain.{NC}")
+        safe_print(f"{YELLOW}[!] Proceeding anyway...{NC}")
+    
+    host = target  # Single host only
+    debug_print(f"[*] Target: {host}")
     
     safe_print(f"\n{GREEN}[+] Starting nxc-sweep{NC}")
     safe_print(f"    nxc Path:    {nxc_path}")
     safe_print(f"    Protocols:   {', '.join(valid_protos).upper()}")
-    safe_print(f"    Targets:     {len(host_list)} host(s)")
+    safe_print(f"    Target:      {host}")
     safe_print(f"    Username:    {args.username}")
     safe_print(f"    Password:    {'*' * len(args.password)}")
     safe_print(f"    Workers:     {args.workers}")
@@ -595,11 +561,6 @@ Use -d/--debug for verbose debug output.{NC}
     safe_print(f"    Debug Mode:  {'ON' if DEBUG_MODE else 'OFF'}")
     safe_print()
     
-    tmp_dir = tempfile.mkdtemp()
-    target_file = os.path.join(tmp_dir, 'targets.txt')
-    
-    debug_print(f"[*] Temp directory: {tmp_dir}")
-    
     results = {}
     success_count = 0
     failed_count = 0
@@ -607,7 +568,7 @@ Use -d/--debug for verbose debug output.{NC}
     
     try:
         protocol_tasks = [
-            (proto, host_list, args, nxc_path, xargs_available, max_jobs)
+            (proto, host, args, nxc_path, xargs_available, max_jobs)
             for proto in valid_protos
         ]
         
@@ -637,7 +598,7 @@ Use -d/--debug for verbose debug output.{NC}
                     if is_valid:
                         success_count += 1
                         if successful_host:
-                            success_details.append(f"{proto_name.upper()} on {successful_host}")
+                            success_details.append(f"{proto_name.upper()} ")
                         else:
                             success_details.append(f"{proto_name.upper()}")
                     else:
@@ -654,21 +615,19 @@ Use -d/--debug for verbose debug output.{NC}
     
     except KeyboardInterrupt:
         safe_print(f"\n{YELLOW}[!] Scan interrupted by user.{NC}")
-    finally:
-        debug_print(f"[*] Cleaning up temp directory: {tmp_dir}")
-        shutil.rmtree(tmp_dir, ignore_errors=True)
     
     # Final summary
     total = success_count + failed_count
     safe_print(f"\n{'='*60}")
     safe_print("NXC-SWEEP SCAN SUMMARY")
     safe_print(f"{'='*60}")
+    safe_print(f"Target: {host}")
     safe_print(f"Protocols tested: {total}")
     safe_print(f"{GREEN}Valid credentials: {success_count}{NC}")
     safe_print(f"{RED}Invalid credentials: {failed_count}{NC}")
     
     if success_details:
-        safe_print(f"\n{GREEN}Successful protocols with hosts:{NC}")
+        safe_print(f"\n{GREEN}Successful protocols:{NC}")
         for detail in success_details:
             safe_print(f"  {GREEN}✓ {detail}{NC}")
     
@@ -679,7 +638,8 @@ Use -d/--debug for verbose debug output.{NC}
         if proto in results:
             is_valid, status, successful_host = results[proto]
             if is_valid:
-                host_info = f" on {successful_host}" if successful_host else ""
+                host_info =""
+                #host_info = f" on {successful_host}" if successful_host else ""
                 safe_print(f"  {GREEN}✓ {proto.upper():6s} - {status}{host_info}{NC}")
             else:
                 safe_print(f"  {RED}✗ {proto.upper():6s} - {status}{NC}")
